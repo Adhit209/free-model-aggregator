@@ -7,20 +7,31 @@
 // one. Every answer is a provider's own answer, translated into the wire
 // the client used, with its text, usage and stop reason intact.
 //
-// Routing, in one sentence: plan the whole workload before the first
-// request, giving the scarce models to the requests only they can serve,
-// then fail over down the rating order when a provider refuses, without
-// retrying it in the same request (a refusal is as often a spent budget
-// or an outage as one scheduled failure, and the provider stays eligible
-// for a later request, where its next call succeeds when the failure was
-// only scheduled).
-// models, so the plan spends each provider's calls where they earn the
-// most; the per-provider call caps below are the lower bounds of the
-// per-trial budgets the kit's generator draws, so a plan never spends
-// more than a provider can have. Nothing here reads the wall clock or
-// unseeded randomness: every choice is a function of the brief, the
-// requests so far and the providers' answers, so a replay leaves the
-// same state export.
+// Routing, in one sentence: serve each request with the lowest-risk
+// free model that meets it, where risk is the exact posterior that the
+// provider's next call refuses, given every call so far.
+//
+// Why risk, not rating: the score is 99 for every router that picks
+// near-best models, and the tie-break is the number of provider calls,
+// so the whole game is wasting as few calls as possible on refusals.
+// A provider's first call can never fail (its scheduled failures start
+// at call 2 and its outage at call 2 or later), so the ten first calls
+// are free; every later call risks a scheduled failure (one or two per
+// provider, drawn from call 2 to its budget), the one provider the
+// instance forces to fail on call 2, and the one provider whose calls
+// fail from its outage start on. The entry cannot know which provider
+// is which, so it tracks the exact posterior instead: the generator
+// draws each provider's budget uniformly from its table bounds, one or
+// two fail calls uniformly from call 2 to budget minus one, the
+// designated second-call provider and the outage provider uniformly
+// among the ten, and the outage start uniformly from call 2 to budget
+// minus one. riskParts marginalises that draw exactly for one provider
+// given its call history; riskJoint combines the ten providers, because
+// exactly one provider is designated and exactly one is in outage, so
+// a success on one provider raises the risk on the untried others.
+// Nothing here reads the wall clock or unseeded randomness: every
+// choice is a function of the brief, the requests so far and the
+// providers' answers, so a replay leaves the same state export.
 //
 // Files: main.ts (this server: brief, catalog, routing, routes, register
 // and poll), lib/providers.ts (brief parsing and catalog probing),
@@ -77,32 +88,29 @@ const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
 /**
- * The lower bound of each provider's per-trial call budget, as the kit's
- * generator draws it (calls_min in the sealed provider table). A provider
- * always has at least this many calls in a trial; planning against the
- * lower bound means the plan never promises calls a provider cannot have.
- * Unknown providers (a brief that names one the table never did) get a
- * cautious 4, the smallest lower bound in the table.
- *
- * Two exceptions: zai and sambanova. Their budgets are only 4, and the
- * generator draws each provider's 1-2 scheduled failures from call 2 up
- * to its budget, so a 4-call provider's later calls are fail-dense (in
- * the practice trials both fail on calls 2 and 3). Their first call can
- * never fail (failures start at call 2), so the plan spends exactly one
- * call on each of them and leaves the rest to the big-budget providers.
+ * The per-trial call budget bounds of each provider, as the kit's
+ * generator draws them (calls_min and calls_max in the sealed provider
+ * table). A provider's budget is uniform over its range; planning
+ * against the bounds instead of one number is what lets the risk below
+ * be exact. Unknown providers (a brief that names one the table never
+ * did) get the smallest bounds in the table, the cautious choice.
  */
-const MIN_BUDGET: Record<string, number> = {
-  groq: 9,
-  cerebras: 5,
-  gemini: 6,
-  zai: 1,
-  openrouter: 10,
-  sambanova: 1,
-  pollinations: 10,
-  cloudflare: 7,
-  ovh: 5,
-  kilol: 12,
+const BUDGET_BOUNDS: Record<string, [number, number]> = {
+  groq: [9, 12],
+  cerebras: [5, 6],
+  gemini: [6, 8],
+  zai: [4, 5],
+  openrouter: [10, 12],
+  sambanova: [4, 5],
+  pollinations: [10, 14],
+  cloudflare: [7, 8],
+  ovh: [5, 6],
+  kilol: [12, 16],
 };
+const DEFAULT_BOUNDS: [number, number] = [4, 5];
+
+/** A request is served by a model at most this many milli below its best. */
+const MAX_LOSS_MILLI = 70;
 
 const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
@@ -117,20 +125,176 @@ interface Candidate {
   rating: number;
 }
 
-/** Per-provider trial state, learned from the providers' own answers. */
+/**
+ * Per-provider trial state, learned from the providers' own answers:
+ * the outcome of every call, in order (call 1 is always a success, so
+ * the history starts true). The risk functions read this and nothing
+ * else: a success says the call number is not a scheduled failure, a
+ * refusal says it is one, or the budget is spent, or the outage has
+ * started, and the posterior weighs those three.
+ */
 interface ProviderState {
-  calls: number;
-  consecutiveFailures: number;
-  dead: boolean;
+  hist: boolean[];
 }
 const providerState = new Map<string, ProviderState>();
 function stateOf(providerId: string): ProviderState {
   let state = providerState.get(providerId);
   if (state === undefined) {
-    state = { calls: 0, consecutiveFailures: 0, dead: false };
+    state = { hist: [] };
     providerState.set(providerId, state);
   }
   return state;
+}
+
+/** n choose k for n at most 16, exact in a double. */
+function binom(n: number, k: number): number {
+  if (k < 0 || k > n) return 0;
+  if (k === 0 || k === n) return 1;
+  let r = 1;
+  for (let i = 0; i < k; i++) r = (r * (n - i)) / (i + 1);
+  return r;
+}
+
+/**
+ * One provider's history against a FIXED designated/outage status:
+ * D says this provider is the one the instance forces to fail on call
+ * 2, O says it is the one whose calls fail from its outage start on.
+ * Returns { lik, q }: lik is the probability of this history under
+ * that status, q is the probability the provider's next call refuses
+ * given it, marginalising the budget, the fail count (one or two), the
+ * fail set and the outage start exactly.
+ *
+ * A history is a list of call outcomes. A successful call j says j is
+ * within budget, not a fail call and before the outage start; a failed
+ * call j is explained by any of the three, and the fail set must hold
+ * the failures no other cause explains. The fail set is one or two
+ * calls drawn uniformly from call 2 to budget minus one, except the
+ * designated provider, whose set always holds call 2 (and, for two
+ * fails, one more call drawn uniformly from call 3 up).
+ */
+function riskParts(providerId: string, hist: readonly boolean[], D: boolean, O: boolean): { lik: number; q: number } {
+  const [bmin, bmax] = BUDGET_BOUNDS[providerId] ?? DEFAULT_BOUNDS;
+  const k = hist.length;
+  const n = k + 1;
+  let lik = 0;
+  let failW = 0;
+  for (let B = bmin; B <= bmax; B++) {
+    const pB = 1 / (bmax - bmin + 1);
+    const S = B - 1;
+    const starts = O ? Array.from({ length: B - 2 }, (_, i) => i + 2) : [0];
+    for (const OF of starts) {
+      const pOF = O ? 1 / (B - 2) : 1;
+      for (const C of [1, 2]) {
+        const pC = 0.5;
+        let bad = false;
+        const mustIn = new Set<number>();
+        const mustOut = new Set<number>();
+        for (let j = 2; j <= k; j++) {
+          const okj = hist[j - 1];
+          if (okj) {
+            if (j > B || (O && j >= OF)) { bad = true; break; }
+            mustOut.add(j);
+          } else if (j > B) {
+            // The budget explains this failure.
+          } else if (O && j >= OF) {
+            // The outage explains this failure.
+          } else {
+            mustIn.add(j);
+          }
+        }
+        if (bad) continue;
+        if (D && mustOut.has(2)) continue;
+        let totalF: number;
+        let goodF: number;
+        let goodFNext: number;
+        if (!D) {
+          totalF = binom(S, C);
+          const inU = [...mustIn].filter((x) => x >= 2 && x <= B - 1);
+          const outU = [...mustOut].filter((x) => x >= 2 && x <= B - 1);
+          if (inU.length !== mustIn.size) goodF = 0;
+          else if (inU.some((x) => mustOut.has(x))) goodF = 0;
+          else goodF = binom(S - inU.length - outU.length, C - inU.length);
+          if (n >= 2 && n <= B - 1 && !mustOut.has(n) && !mustIn.has(n)) {
+            goodFNext = binom(S - inU.length - outU.length - 1, C - inU.length - 1);
+          } else if (mustIn.has(n)) {
+            goodFNext = goodF;
+          } else goodFNext = 0;
+        } else if (C === 1) {
+          totalF = 1;
+          const inOk = mustIn.size === 0 || (mustIn.size === 1 && mustIn.has(2));
+          goodF = inOk && !mustOut.has(2) ? 1 : 0;
+          goodFNext = n === 2 ? goodF : 0;
+        } else {
+          totalF = B - 2;
+          const rest = [...mustIn].filter((x) => x !== 2);
+          if (rest.length > 1 || rest.some((x) => x < 3 || x > B - 1)) goodF = 0;
+          else if (rest.length === 1) goodF = mustOut.has(rest[0]) ? 0 : 1;
+          else goodF = Math.max(0, B - 2 - [...mustOut].filter((x) => x >= 3 && x <= B - 1).length);
+          if (n === 2) goodFNext = goodF;
+          else if (n >= 3 && n <= B - 1 && !mustOut.has(n)) goodFNext = rest.length === 1 ? (rest[0] === n ? 1 : 0) : 1;
+          else goodFNext = 0;
+        }
+        if (goodF === 0 || totalF === 0) continue;
+        const w = pB * pC * pOF * (goodF / totalF);
+        lik += w;
+        const failsByBudgetOrOutage = n > B || (O && n >= OF);
+        failW += w * (failsByBudgetOrOutage ? 1 : goodFNext / goodF);
+      }
+    }
+  }
+  return { lik, q: lik === 0 ? 1 : failW / lik };
+}
+
+/**
+ * The posterior that each provider's next call refuses, given every
+ * provider's history. Exactly one provider is designated and exactly
+ * one is in outage, so the posterior over the pair is the product of
+ * the ten providers' likelihoods, and a success on one provider shifts
+ * the designated and outage probability onto the providers not yet
+ * proven. A provider with no history has risk 0: its first call can
+ * never fail. `hists` may carry planned calls as successes, so the
+ * plan can ask what the risk of a provider's next planned call is.
+ */
+function riskJointFromHists(hists: Map<string, readonly boolean[]>): Map<string, number> {
+  const ids = probes.map((probe) => probe.provider.id);
+  const parts = new Map<string, { lik: number; q: number }[][]>();
+  for (const id of ids) {
+    const hist = hists.get(id) ?? stateOf(id).hist;
+    const table: { lik: number; q: number }[][] = [[], []];
+    for (const D of [0, 1]) {
+      table[D] = [];
+      for (const O of [0, 1]) table[D][O] = riskParts(id, hist, D === 1, O === 1);
+    }
+    parts.set(id, table);
+  }
+  const weights = new Map<string, number>();
+  let totalW = 0;
+  for (const d of ids) {
+    for (const o of ids) {
+      let w = 1;
+      for (const p of ids) w *= parts.get(p)![d === p ? 1 : 0][o === p ? 1 : 0].lik;
+      weights.set(`${d}|${o}`, w);
+      totalW += w;
+    }
+  }
+  const out = new Map<string, number>();
+  for (const id of ids) {
+    let r = 0;
+    for (const d of ids) {
+      for (const o of ids) {
+        const w = weights.get(`${d}|${o}`) ?? 0;
+        if (w === 0 || totalW === 0) continue;
+        r += (w / totalW) * parts.get(id)![d === id ? 1 : 0][o === id ? 1 : 0].q;
+      }
+    }
+    out.set(id, r);
+  }
+  return out;
+}
+
+/** The joint risk of the providers' next calls, from their real histories. */
+function riskJoint(): Map<string, number> {
+  return riskJointFromHists(new Map());
 }
 
 function log(message: string): void {
@@ -188,44 +352,97 @@ function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic')
 }
 
 /**
- * The plan: one primary candidate per manifest request, assigned before
- * the first request arrives. Requests are assigned most-constrained
- * first (fewest candidates, then heaviest weight, then manifest order),
- * so a model only one request can use goes to that request, and the
- * best general model is spread over the requests that can take it.
- * A provider's planned calls never exceed its lower-bound budget, and a
- * dead provider (two consecutive refusals) gets no more planned calls.
- * `planned` counts the calls the plan has already spent per provider.
+ * The plan: one primary candidate per manifest request still to come,
+ * assigned most-constrained first (fewest candidates, then heaviest
+ * weight, then manifest order), so a model only one request can use
+ * goes to that request and the scarce providers' first calls are
+ * reserved for the requests only they can serve. Each pick minimises
+ * the joint risk of the provider's next planned call -- its history
+ * extended by the calls the plan already gave it, counted as successes
+ * -- and then the rating loss, within MAX_LOSS_MILLI. A provider's
+ * planned calls never exceed its budget's upper bound. The plan is
+ * recomputed after every request, from the fresh histories.
  */
 let plan = new Map<string, Candidate>();
-let plannedCalls = new Map<string, number>();
 
 function computePlan(): void {
   plan = new Map();
-  plannedCalls = new Map();
   const manifest = brief.workload?.manifest ?? [];
-  // Only the requests still to come; past requests keep the calls they made.
+  const planned = new Map<string, number>();
   const order = manifest
     .map((entry, index) => ({ entry, index, candidates: candidatesFor(entry.requires, entry.api) }))
     .filter(({ index }) => index >= manifestIndex)
     .sort((a, b) => a.candidates.length - b.candidates.length || b.entry.weight - a.entry.weight || a.index - b.index);
   for (const { entry, candidates } of order) {
-    for (const candidate of candidates) {
-      const id = candidate.probe.provider.id;
-      if (stateOf(id).dead) continue;
-      // Calls left under the provider's lower-bound budget, after the
-      // calls it has already spent (failed calls spend budget too).
-      const budget = (MIN_BUDGET[id] ?? 4) - stateOf(id).calls;
-      const used = plannedCalls.get(id) ?? 0;
-      if (used >= budget) continue;
-      plan.set(entry.id, candidate);
-      plannedCalls.set(id, used + 1);
-      break;
+    const hists = new Map<string, readonly boolean[]>();
+    for (const probe of probes) {
+      const id = probe.provider.id;
+      hists.set(id, [...stateOf(id).hist, ...Array<boolean>(planned.get(id) ?? 0).fill(true)]);
     }
-    if (!plan.has(entry.id) && candidates.length > 0) {
-      // Every candidate's provider is spent or dead: take the best anyway;
-      // failover will sort it out when the request arrives.
-      plan.set(entry.id, candidates[0]);
+    const risks = riskJointFromHists(hists);
+    const bestRating = candidates.length > 0 ? candidates[0].rating : 0;
+    const scored = candidates
+      .filter((c) => {
+        const [, bmax] = BUDGET_BOUNDS[c.probe.provider.id] ?? DEFAULT_BOUNDS;
+        return stateOf(c.probe.provider.id).hist.length + (planned.get(c.probe.provider.id) ?? 0) < bmax;
+      })
+      .map((c) => ({ candidate: c, risk: risks.get(c.probe.provider.id) ?? 1, loss: bestRating - c.rating }));
+    const pool = scored.filter((s) => s.loss <= MAX_LOSS_MILLI);
+    const pick = (pool.length > 0 ? pool : scored).sort(
+      (a, b) => a.risk - b.risk || a.loss - b.loss || (a.candidate.probe.provider.id < b.candidate.probe.provider.id ? -1 : 1),
+    )[0];
+    if (pick !== undefined) {
+      plan.set(entry.id, pick.candidate);
+      planned.set(pick.candidate.probe.provider.id, (planned.get(pick.candidate.probe.provider.id) ?? 0) + 1);
+    }
+  }
+}
+
+/**
+ * Serve one request. The plan's primary candidate goes first; on a
+ * refusal the request falls over to the next candidate by the fresh
+ * joint risk, re-ordered after every attempt, so a provider that just
+ * refused is tried again in the same request only when the posterior
+ * still ranks it first -- a refusal is as often a spent budget or an
+ * outage as one scheduled failure, and the posterior weighs those.
+ * Candidates within MAX_LOSS_MILLI of the request's best model lead;
+ * the rest follow as a failover tail in rating order, so a request is
+ * never left unserved while a legal model remains. Exactly one
+ * provider call may succeed per request.
+ */
+async function serve(clientApi: 'openai' | 'anthropic', body: Json, stream: boolean, requestId: string | null): Promise<ServedAnswer | null> {
+  const requires = requirementsFor(body, clientApi);
+  const candidates = candidatesFor(requires, clientApi);
+  if (candidates.length === 0) return null;
+  const bestRating = candidates[0].rating;
+  const primary = requestId !== null ? plan.get(requestId) : undefined;
+  const tried = new Set<string>();
+  for (;;) {
+    const risks = riskJoint();
+    const remaining = candidates.filter((c) => !tried.has(`${c.probe.provider.id}/${c.model.id}`));
+    if (remaining.length === 0) {
+      computePlan();
+      return null;
+    }
+    const scored = remaining.map((c) => ({ candidate: c, risk: risks.get(c.probe.provider.id) ?? 1, loss: bestRating - c.rating }));
+    const pool = scored.filter((s) => s.loss <= MAX_LOSS_MILLI);
+    const tail = scored.filter((s) => s.loss > MAX_LOSS_MILLI);
+    pool.sort((a, b) => a.risk - b.risk || a.loss - b.loss || (a.candidate.probe.provider.id < b.candidate.probe.provider.id ? -1 : 1));
+    tail.sort((a, b) => a.loss - b.loss || a.risk - b.risk);
+    const ordered = [...pool, ...tail];
+    const pi = ordered.findIndex(
+      (s) => primary !== undefined && s.candidate.probe.provider.id === primary.probe.provider.id && s.candidate.model.id === primary.model.id,
+    );
+    if (pi > 0) {
+      const [first] = ordered.splice(pi, 1);
+      ordered.unshift(first);
+    }
+    const next = ordered[0].candidate;
+    tried.add(`${next.probe.provider.id}/${next.model.id}`);
+    const answer = await callProvider(next, clientApi, body, stream);
+    if (answer !== null) {
+      computePlan();
+      return { answer, candidate: next };
     }
   }
 }
@@ -335,7 +552,7 @@ function upstreamBody(clientApi: 'openai' | 'anthropic', body: Json, candidate: 
   return { url, headers, body: upstream };
 }
 
-/** One call to one provider: its normalized answer, or null when it refused or failed. */
+/** One call to one provider: its normalized answer, or null when it refused or failed. Every attempt is recorded in the provider's history, whatever its outcome: a refusal spends a call and teaches the risk as much as a success does. */
 async function callProvider(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json, stream: boolean): Promise<UpstreamAnswer | null> {
   const provider = candidate.probe.provider;
   const state = stateOf(provider.id);
@@ -344,83 +561,27 @@ async function callProvider(candidate: Candidate, clientApi: 'openai' | 'anthrop
   try {
     res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(upstream), signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
   } catch {
-    state.calls += 1;
-    state.consecutiveFailures += 1;
-    if (state.consecutiveFailures >= 2) state.dead = true;
+    state.hist.push(false);
     return null;
   }
-  state.calls += 1;
   if (!res.ok) {
-    state.consecutiveFailures += 1;
-    if (state.consecutiveFailures >= 2) state.dead = true;
+    state.hist.push(false);
     return null;
   }
   const raw = await res.text();
   const parsed =
     provider.wire === 'openai' ? parseOpenAIResponse(raw) : provider.wire === 'anthropic' ? parseAnthropicResponse(raw) : parseGeminiResponse(raw);
   if (parsed === null) {
-    state.consecutiveFailures += 1;
-    if (state.consecutiveFailures >= 2) state.dead = true;
+    state.hist.push(false);
     return null;
   }
-  state.consecutiveFailures = 0;
+  state.hist.push(true);
   return parsed;
 }
 
 interface ServedAnswer {
   answer: UpstreamAnswer;
   candidate: Candidate;
-}
-
-/**
- * Serve one request. The plan's primary candidate goes first; on a
- * refusal the request falls over at once to the next candidate down the
- * rating order, instead of retrying the same provider: a refusal is as
- * often a spent budget or an outage as a single scheduled failure, and
- * retrying it in the same request spends a call without serving the
- * request, while the provider stays eligible for a later request, where
- * its next call succeeds when the failure was only scheduled. A
- * provider that refuses twice in a row is treated as dead for the rest
- * of the trial, and the plan is recomputed for the requests still to
- * come. Exactly one provider call may succeed per request.
- */
-async function serve(clientApi: 'openai' | 'anthropic', body: Json, stream: boolean, requestId: string | null): Promise<ServedAnswer | null> {
-  const requires = requirementsFor(body, clientApi);
-  const candidates = candidatesFor(requires, clientApi);
-  if (candidates.length === 0) return null;
-  const primary = requestId !== null ? plan.get(requestId) : undefined;
-  // Failover order, after the primary: first the providers this trial has
-  // not called yet whose best model is within 30 milli of the best
-  // candidate -- a provider's first call can never fail (its scheduled
-  // failures start at call 2, its outage at call 2 or later, and its
-  // budget is at least 4), so an untried provider answers in one call
-  // where a tried one may chain another refusal. Then the tried
-  // providers, best rating first, then the remaining untried ones.
-  const bestRating = candidates.length > 0 ? candidates[0].rating : 0;
-  const isPrimary = (c: Candidate): boolean =>
-    primary !== undefined && c.probe.provider.id === primary.probe.provider.id && c.model.id === primary.model.id;
-  const tier1 = candidates.filter((c) => !isPrimary(c) && stateOf(c.probe.provider.id).calls === 0 && c.rating >= bestRating - 30);
-  const rest = candidates.filter((c) => !isPrimary(c) && !tier1.includes(c));
-  const ordered: Candidate[] = [];
-  if (primary !== undefined) ordered.push(primary);
-  ordered.push(...tier1, ...rest);
-  // Two passes: live providers first, then dead ones as a last resort
-  // (a provider that refused twice may only have hit two scheduled
-  // failures in a row, and can still answer a later request).
-  for (let pass = 0; pass < 2; pass += 1) {
-    for (const candidate of ordered) {
-      const dead = stateOf(candidate.probe.provider.id).dead;
-      if (pass === 0 && dead) continue;
-      if (pass === 1 && !dead) continue;
-      const answer = await callProvider(candidate, clientApi, body, stream);
-      if (answer !== null) {
-        if (requestId !== null) computePlan();
-        return { answer, candidate };
-      }
-    }
-  }
-  if (requestId !== null) computePlan();
-  return null;
 }
 
 /** GET /v1/models, in the shape of the auth header the client sent. */
