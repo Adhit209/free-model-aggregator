@@ -9,7 +9,16 @@
 //
 // Routing, in one sentence: serve each request with the lowest-risk
 // free model that meets it, where risk is the exact posterior that the
-// provider's next call refuses, given every call so far.
+// provider's next call refuses, given every call so far -- and given
+// what each refusal said. A provider's error body names its cause
+// ("budget is spent", "is out", "refused this call"), and the cause
+// is the difference between a dead provider and a live one: a spent
+// budget or a started outage means every later call refuses, so the
+// router never spends another call there, while a scheduled refusal
+// means one fail is used up and the provider is safer than before.
+// The first router read only success or failure and priced every
+// refusal as if the provider might already be dead; this one reads
+// the sentence.
 //
 // Why risk, not rating: the score is 99 for every router that picks
 // near-best models, and the tie-break is the number of provider calls,
@@ -128,19 +137,55 @@ interface Candidate {
 /**
  * Per-provider trial state, learned from the providers' own answers:
  * the outcome of every call, in order (call 1 is always a success, so
- * the history starts true). The risk functions read this and nothing
- * else: a success says the call number is not a scheduled failure, a
- * refusal says it is one, or the budget is spent, or the outage has
- * started, and the posterior weighs those three.
+ * the history starts true), and, for every refusal, the cause the
+ * provider's own error message named. The risk functions read this
+ * and nothing else: a success says the call number is not a scheduled
+ * failure, a refusal says it is one, or the budget is spent, or the
+ * outage has started, and the posterior weighs those three.
+ *
+ * The cause is the part the first router threw away. A provider's
+ * error body names it in plain words -- "budget is spent", "is out",
+ * "refused this call" -- and each cause pins a different piece of the
+ * draw: a spent budget pins the budget to the call before (the
+ * provider is dead, every later call refuses), an outage pins the
+ * outage start to that call (also dead), and a scheduled refusal
+ * puts that call number in the fail set while ruling the other two
+ * out for it. Without the cause, one refusal leaves the posterior
+ * spread over "dead" and "one fail used up", and the router prices
+ * the provider as if it might already be dead for the rest of the
+ * trial. With it, a refusal is either a dead provider (never call
+ * again) or a provider with one scheduled fail spent (safer than
+ * before, because a fail is used up and the outage did not start).
  */
 interface ProviderState {
   hist: boolean[];
+  causes: (RefusalCause | null)[];
+}
+
+/** What a provider's error message said its refusal was. */
+type RefusalCause = 'budget' | 'outage' | 'refused' | 'concurrent';
+
+/**
+ * Read the cause out of a provider's error body. Every wire carries
+ * it in `error.message`: the env names the budget, the outage and
+ * the scheduled refusal in distinct words, so a substring match is
+ * exact. `concurrent` is a 429 for a provider that serves one call
+ * at a time: it spends no call number, so the caller records nothing
+ * for it. Anything unrecognised is null: the old behaviour (a bare
+ * failure, no cause) is the safe fallback.
+ */
+function refusalCauseOf(text: string): RefusalCause | null {
+  if (text.includes('free-tier budget is spent')) return 'budget';
+  if (text.includes('refused this call')) return 'refused';
+  if (text.includes('is out')) return 'outage';
+  if (text.includes('call at a time')) return 'concurrent';
+  return null;
 }
 const providerState = new Map<string, ProviderState>();
 function stateOf(providerId: string): ProviderState {
   let state = providerState.get(providerId);
   if (state === undefined) {
-    state = { hist: [] };
+    state = { hist: [], causes: [] };
     providerState.set(providerId, state);
   }
   return state;
@@ -172,28 +217,70 @@ function binom(n: number, k: number): number {
  * designated provider, whose set always holds call 2 (and, for two
  * fails, one more call drawn uniformly from call 3 up).
  */
-function riskParts(providerId: string, hist: readonly boolean[], D: boolean, O: boolean): { lik: number; q: number } {
+function riskParts(
+  providerId: string,
+  hist: readonly boolean[],
+  causes: readonly (RefusalCause | null)[],
+  D: boolean,
+  O: boolean,
+): { lik: number; q: number } {
   const [bmin, bmax] = BUDGET_BOUNDS[providerId] ?? DEFAULT_BOUNDS;
   const k = hist.length;
   const n = k + 1;
+  // The causes pin pieces of the draw. A budget failure at call j+1
+  // pins B = j (the first one: later calls fail on budget too, so
+  // later ones say nothing new); an outage failure at call j+1 pins
+  // the outage start to j+1 (earlier calls prove it starts after
+  // them, the failure proves it starts by then); a scheduled refusal
+  // at call j+1 puts j+1 in the fail set, forces B >= j+1 and the
+  // outage start past j+1. Causes after the first budget or outage
+  // failure repeat it and carry no new information.
+  let knownBudget: number | null = null;
+  let knownOutage: number | null = null;
+  let minBudget = 0;
+  let minOutageAfter = 0;
+  const knownFails = new Set<number>();
+  for (let j = 0; j < hist.length; j++) {
+    const cause = causes[j] ?? null;
+    if (cause === 'budget') {
+      if (knownBudget === null) knownBudget = j;
+    } else if (cause === 'outage') {
+      if (knownOutage === null) knownOutage = j + 1;
+      // The budget check runs before the outage check, so a call
+      // that failed on outage was inside the budget.
+      if (j + 1 > minBudget) minBudget = j + 1;
+    } else if (cause === 'refused') {
+      knownFails.add(j + 1);
+      if (j + 1 > minBudget) minBudget = j + 1;
+      if (j + 1 > minOutageAfter) minOutageAfter = j + 1;
+    }
+  }
+  if (knownOutage !== null && !O) return { lik: 0, q: 1 };
   let lik = 0;
   let failW = 0;
-  for (let B = bmin; B <= bmax; B++) {
+  for (let B = Math.max(bmin, minBudget); B <= (knownBudget ?? bmax); B++) {
     const pB = 1 / (bmax - bmin + 1);
     const S = B - 1;
-    const starts = O ? Array.from({ length: B - 2 }, (_, i) => i + 2) : [0];
+    const ofLo = Math.max(2, minOutageAfter + 1);
+    const starts =
+      knownOutage !== null ? [knownOutage] : O ? Array.from({ length: Math.max(0, B - ofLo) }, (_, i) => i + ofLo) : [0];
     for (const OF of starts) {
-      const pOF = O ? 1 / (B - 2) : 1;
+      const pOF = knownOutage !== null ? 1 : O ? 1 / (B - 2) : 1;
       for (const C of [1, 2]) {
         const pC = 0.5;
         let bad = false;
-        const mustIn = new Set<number>();
+        const mustIn = new Set<number>(knownFails);
         const mustOut = new Set<number>();
         for (let j = 2; j <= k; j++) {
           const okj = hist[j - 1];
           if (okj) {
             if (j > B || (O && j >= OF)) { bad = true; break; }
             mustOut.add(j);
+          } else if (causes[j - 1] === 'refused') {
+            // The provider named this one a scheduled refusal: the
+            // budget and the outage did not explain it, so the fail
+            // set holds it, whatever B and the outage start are.
+            mustIn.add(j);
           } else if (j > B) {
             // The budget explains this failure.
           } else if (O && j >= OF) {
@@ -255,15 +342,25 @@ function riskParts(providerId: string, hist: readonly boolean[], D: boolean, O: 
  * never fail. `hists` may carry planned calls as successes, so the
  * plan can ask what the risk of a provider's next planned call is.
  */
-function riskJointFromHists(hists: Map<string, readonly boolean[]>): Map<string, number> {
+function riskJointFromHists(
+  hists: Map<string, readonly boolean[]>,
+  causesMap: Map<string, readonly (RefusalCause | null)[]> = new Map(),
+): Map<string, number> {
   const ids = probes.map((probe) => probe.provider.id);
   const parts = new Map<string, { lik: number; q: number }[][]>();
   for (const id of ids) {
     const hist = hists.get(id) ?? stateOf(id).hist;
+    // Planned calls are successes with no cause; the real causes
+    // stay attached to the real calls they name.
+    const rawCauses = causesMap.get(id) ?? stateOf(id).causes;
+    const causes =
+      hist.length > rawCauses.length
+        ? [...rawCauses, ...Array<RefusalCause | null>(hist.length - rawCauses.length).fill(null)]
+        : rawCauses;
     const table: { lik: number; q: number }[][] = [[], []];
     for (const D of [0, 1]) {
       table[D] = [];
-      for (const O of [0, 1]) table[D][O] = riskParts(id, hist, D === 1, O === 1);
+      for (const O of [0, 1]) table[D][O] = riskParts(id, hist, causes, D === 1, O === 1);
     }
     parts.set(id, table);
   }
@@ -375,11 +472,13 @@ function computePlan(): void {
     .sort((a, b) => a.candidates.length - b.candidates.length || b.entry.weight - a.entry.weight || a.index - b.index);
   for (const { entry, candidates } of order) {
     const hists = new Map<string, readonly boolean[]>();
+    const causesMap = new Map<string, readonly (RefusalCause | null)[]>();
     for (const probe of probes) {
       const id = probe.provider.id;
       hists.set(id, [...stateOf(id).hist, ...Array<boolean>(planned.get(id) ?? 0).fill(true)]);
+      causesMap.set(id, [...stateOf(id).causes, ...Array<RefusalCause | null>(planned.get(id) ?? 0).fill(null)]);
     }
-    const risks = riskJointFromHists(hists);
+    const risks = riskJointFromHists(hists, causesMap);
     const bestRating = candidates.length > 0 ? candidates[0].rating : 0;
     const scored = candidates
       .filter((c) => {
@@ -428,7 +527,11 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, stream: bool
     const pool = scored.filter((s) => s.loss <= MAX_LOSS_MILLI);
     const tail = scored.filter((s) => s.loss > MAX_LOSS_MILLI);
     pool.sort((a, b) => a.risk - b.risk || a.loss - b.loss || (a.candidate.probe.provider.id < b.candidate.probe.provider.id ? -1 : 1));
-    tail.sort((a, b) => a.loss - b.loss || a.risk - b.risk);
+    // The tail is risk-first too: after a refusal the request is one
+    // failure from unserved, so a safer model beats a nearer-rated one
+    // even past the loss cap -- the cap guards quality, the tail
+    // guards the request itself.
+    tail.sort((a, b) => a.risk - b.risk || a.loss - b.loss);
     const ordered = [...pool, ...tail];
     const pi = ordered.findIndex(
       (s) => primary !== undefined && s.candidate.probe.provider.id === primary.probe.provider.id && s.candidate.model.id === primary.model.id,
@@ -552,7 +655,7 @@ function upstreamBody(clientApi: 'openai' | 'anthropic', body: Json, candidate: 
   return { url, headers, body: upstream };
 }
 
-/** One call to one provider: its normalized answer, or null when it refused or failed. Every attempt is recorded in the provider's history, whatever its outcome: a refusal spends a call and teaches the risk as much as a success does. */
+/** One call to one provider: its normalized answer, or null when it refused or failed. Every attempt is recorded in the provider's history, whatever its outcome: a refusal spends a call and teaches the risk as much as a success does. A refusal's cause is read out of the provider's error body (see refusalCauseOf): it is what lets the risk tell a dead provider from one with a scheduled fail spent. */
 async function callProvider(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json, stream: boolean): Promise<UpstreamAnswer | null> {
   const provider = candidate.probe.provider;
   const state = stateOf(provider.id);
@@ -562,10 +665,20 @@ async function callProvider(candidate: Candidate, clientApi: 'openai' | 'anthrop
     res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(upstream), signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
   } catch {
     state.hist.push(false);
+    state.causes.push(null);
     return null;
   }
   if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const cause = refusalCauseOf(text);
+    if (cause === 'concurrent') {
+      // No call number was spent, so the history must not move:
+      // recording a failure here would blame the provider's next
+      // call for a refusal that never touched its budget.
+      return null;
+    }
     state.hist.push(false);
+    state.causes.push(cause);
     return null;
   }
   const raw = await res.text();
@@ -573,9 +686,11 @@ async function callProvider(candidate: Candidate, clientApi: 'openai' | 'anthrop
     provider.wire === 'openai' ? parseOpenAIResponse(raw) : provider.wire === 'anthropic' ? parseAnthropicResponse(raw) : parseGeminiResponse(raw);
   if (parsed === null) {
     state.hist.push(false);
+    state.causes.push(null);
     return null;
   }
   state.hist.push(true);
+  state.causes.push(null);
   return parsed;
 }
 
